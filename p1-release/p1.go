@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	// You will need more packages as you go. Add them here when you need
@@ -51,7 +52,22 @@ type SeqConfig struct {
 func RunSeq(cfg SeqConfig) []float64 {
 	// Write your code here.
 	// See project1-desc.pdf, Part 1 for what this function must do.
-	panic("not implemented yet: Part 1")
+	w := Init(cfg.Seed)
+	b := NewBatcher(cfg.Seed, cfg.BatchSize)
+	for step := 0; step < cfg.Steps; step++ {
+		batch := b.Next(step)
+		g := Grad(w, batch)
+		for i := range w {
+			w[i] -= (cfg.LR * g[i]) / float64(cfg.BatchSize)
+		}
+		if cfg.OnStep != nil {
+			copyArr := make([]float64, len(w))
+			copy(copyArr, w)
+			cfg.OnStep(step, copyArr)
+		}
+	}
+
+	return w
 }
 
 /* Part 2 -- Parallel local trainer (15 points). See project1-desc.pdf, Part 2. */
@@ -71,7 +87,75 @@ func RunLocal(cfg LocalConfig) []float64 {
 	// Write your code here.
 	// See project1-desc.pdf, Part 2. Sum partial gradients in rank order so
 	// two runs with the same input return the same result, bit for bit.
-	panic("not implemented yet: Part 2")
+	if cfg.NRanks <= 0 {
+		panic("NRanks must be positive")
+	}
+
+	if cfg.BatchSize%cfg.NRanks != 0 {
+		panic("BatchSize must be divisible by NRanks")
+	}
+
+	resultChannel := make(chan []float64, 1)
+	gradChannels := make([]chan []float64, cfg.NRanks)
+	totalChannels := make([]chan []float64, cfg.NRanks)
+
+	for rank := 0; rank < cfg.NRanks; rank++ {
+		gradChannels[rank] = make(chan []float64)
+		totalChannels[rank] = make(chan []float64)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(cfg.NRanks)
+
+	for rank := 0; rank < cfg.NRanks; rank++ {
+
+		go func(r int) {
+			defer wg.Done()
+			rankW := Init(cfg.Seed)
+			b := NewBatcher(cfg.Seed, cfg.BatchSize)
+
+			for step := 0; step < cfg.Steps; step++ {
+				batch := b.Next(step)
+				sliceSize := cfg.BatchSize / cfg.NRanks
+				rankBatch := batch[r*sliceSize : (r+1)*sliceSize]
+				partialGrad := Grad(rankW, rankBatch)
+
+				// rank 0 summing and sending back results
+				var totalGrad []float64
+				if r == 0 {
+					totalGrad = make([]float64, len(partialGrad))
+					copy(totalGrad, partialGrad)
+
+					for src := 1; src < cfg.NRanks; src++ {
+						partial := <-gradChannels[src]
+						for i := range totalGrad {
+							totalGrad[i] += partial[i]
+						}
+					}
+
+					for dest := 1; dest < cfg.NRanks; dest++ {
+						totalCopy := make([]float64, len(totalGrad))
+						copy(totalCopy, totalGrad)
+						totalChannels[dest] <- totalCopy
+					}
+				} else {
+					gradChannels[r] <- partialGrad
+					totalGrad = <-totalChannels[r]
+				}
+
+				for i := range rankW {
+					rankW[i] -= (cfg.LR * totalGrad[i]) / float64(cfg.BatchSize)
+				}
+			}
+			if r == 0 {
+				resultChannel <- rankW
+			}
+		}(rank)
+
+	}
+
+	wg.Wait()
+	return <-resultChannel
 }
 
 /* Part 3 -- Coordinator and workers over RPC (65 points). */
