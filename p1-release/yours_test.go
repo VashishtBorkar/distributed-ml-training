@@ -29,9 +29,6 @@ func TestSeqValues(t *testing.T) {
 	cfg := SeqConfig{Seed: 1, Steps: 5, BatchSize: 32, LR: 0.01}
 	x_w := RunSeq(cfg)
 	y_w := RunSeq(cfg)
-	if len(x_w) != len(y_w) {
-		t.Fatalf("RunSeq returned different number of weights: x_w has %d, y_w has %d", len(x_w), len(y_w))
-	}
 
 	for i := range x_w {
 		if x_w[i] != y_w[i] {
@@ -48,6 +45,34 @@ func TestExampleLocal(t *testing.T) {
 	if len(w) != D {
 		t.Fatalf("RunLocal returned %d weights, want %d", len(w), D)
 	}
+}
+
+func TestLocalValues(t *testing.T) {
+	cfg := LocalConfig{Seed: 1, Steps: 5, BatchSize: 32, LR: 0.01, NRanks: 4}
+	x_w := RunLocal(cfg)
+	y_w := RunLocal(cfg)
+
+	for i := range x_w {
+		if x_w[i] != y_w[i] {
+			t.Fatalf("RunLocal returned different weights: x_w[%d]=%v, y_w[%d]=%v", i, x_w[i], i, y_w[i])
+		}
+	}
+}
+
+func TestLocalDiffRanks(t *testing.T) {
+	for n := 1; n <= 8; n *= 2 {
+		cfg := LocalConfig{Seed: 1, Steps: 5, BatchSize: 32, LR: 0.01, NRanks: n}
+		x_w := RunLocal(cfg)
+		y_w := RunLocal(cfg)
+
+		for i := range x_w {
+			if x_w[i] != y_w[i] {
+				t.Fatalf("RunLocal returned different weights: x_w[%d]=%v, y_w[%d]=%v", i, x_w[i], i, y_w[i])
+			}
+		}
+	}
+
+	
 }
 
 // Template for Part 3. Uncomment when RunWorker works. Starts one

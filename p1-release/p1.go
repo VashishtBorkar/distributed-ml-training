@@ -23,6 +23,8 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
+	"net/rpc"
 	"os"
 	"os/signal"
 	"strings"
@@ -168,7 +170,17 @@ type Worker struct{}
 func (Worker) Grad(args GradArgs, reply *GradReply) error {
 	// Write your code here.
 	// See project1-desc.pdf, Part 3.1.
-	panic("not implemented yet: Part 3.1 (Worker.Grad)")
+
+	// check for
+	if len(args.W) != D {
+		return fmt.Errorf("Worker.Grad: len(w) = %d, want %d", len(args.W), D)
+	}
+	if len(args.Batch) == 0 {
+		return fmt.Errorf("Worker.Grad: empty batch")
+	}
+
+	reply.Grad = Grad(args.W, args.Batch)
+	return nil
 }
 
 // Ping is a health check. Leave it as it is.
@@ -182,7 +194,34 @@ func (Worker) Ping(_ PingArgs, reply *PingReply) error {
 func RunWorker(addr string) (actualAddr string, stop func(), err error) {
 	// Write your code here.
 	// See project1-desc.pdf, Part 3.1.
-	panic("not implemented yet: Part 3.1 (RunWorker)")
+	server := rpc.NewServer()
+
+	if err := server.RegisterName("Worker", Worker{}); err != nil {
+		return "", nil, fmt.Errorf("RunWorker: %w", err)
+	}
+
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return "", nil, fmt.Errorf("RunWorker: %w", err)
+	}
+
+	var stopOnce sync.Once
+	stop = func() {
+		stopOnce.Do(func() { _ = listener.Close() })
+	}
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go server.ServeConn(conn)
+		}
+	}()
+
+	return listener.Addr().String(), stop, nil
+
 }
 
 // DistConfig holds the inputs to RunCoordinator. Do not add or remove
