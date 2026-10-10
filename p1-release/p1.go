@@ -237,13 +237,176 @@ type DistConfig struct {
 	OnStep    func(step int, w []float64)
 }
 
+type workerState struct {
+	addr  string
+	alive bool
+	busy  bool
+}
+
+type sliceResult struct {
+	workerIndex int
+	sliceIndex  int
+	grad        []float64
+	err         error
+}
+
 // RunCoordinator drives training end to end and returns the final
 // weights.
 func RunCoordinator(cfg DistConfig) []float64 {
 	// Write your code here.
 	// See project1-desc.pdf, Part 3.2 and Part 3.3.
 	// You are free to add helper types and helper functions.
-	panic("not implemented yet: Part 3 (RunCoordinator)")
+	if cfg.NSlices <= 0 {
+		panic("RunCoordinator: invalid Nslices")
+	}
+
+	if cfg.BatchSize%cfg.NSlices != 0 {
+		panic("RunCoordinator: BatchSize must be divisible by Nslices")
+	}
+	if len(cfg.Workers) == 0 {
+		panic("RunCoordinator: no workers")
+	}
+
+	w := Init(cfg.Seed)
+	batcher := NewBatcher(cfg.Seed, cfg.BatchSize)
+	sliceSize := cfg.BatchSize / cfg.NSlices
+
+	workers := make([]workerState, len(cfg.Workers))
+	for i, addr := range cfg.Workers {
+		workers[i] = workerState{
+			addr:  addr,
+			alive: true,
+			busy:  false,
+		}
+	}
+
+	for step := 0; step < cfg.Steps; step++ {
+		batch := batcher.Next(step)
+		results := make(chan sliceResult, cfg.NSlices)
+		partialGrads := make([][]float64, cfg.NSlices)
+
+		launch := func(workerIndex int, sliceIndex int) {
+			start := sliceIndex * sliceSize
+			end := start + sliceSize
+
+			workerAddr := workers[workerIndex].addr
+
+			weightCopy := make([]float64, len(w))
+			copy(weightCopy, w)
+
+			args := GradArgs{
+				Step:       step,
+				SliceIndex: sliceIndex,
+				W:          weightCopy,
+				Batch:      batch[start:end],
+			}
+
+			workers[workerIndex].busy = true
+
+			go func(workerIndex int, addr string, args GradArgs) {
+				client, err := rpc.Dial("tcp", addr)
+				if err != nil {
+					results <- sliceResult{
+						workerIndex: workerIndex,
+						sliceIndex:  args.SliceIndex,
+						err:         err,
+					}
+					return
+				}
+				defer client.Close()
+
+				var reply GradReply
+				err = client.Call("Worker.Grad", args, &reply)
+
+				results <- sliceResult{
+					workerIndex: workerIndex,
+					sliceIndex:  args.SliceIndex,
+					grad:        reply.Grad,
+					err:         err,
+				}
+			}(workerIndex, workerAddr, args)
+		}
+
+		nextSlice := 0
+		retrySlices := make([]int, 0)
+
+		getNextSlice := func() (int, bool) {
+			if len(retrySlices) > 0 {
+				sliceIndex := retrySlices[0]
+				retrySlices = retrySlices[1:]
+				return sliceIndex, true
+			}
+
+			if nextSlice < cfg.NSlices {
+				sliceIndex := nextSlice
+				nextSlice++
+				return sliceIndex, true
+			}
+		
+			return 0, false
+		}
+
+		dispatch := func() {
+			for workerIndex := range workers {
+				if !workers[workerIndex].alive || workers[workerIndex].busy {
+					continue
+				}
+
+				sliceIndex, available := getNextSlice()
+				if !available {
+					return
+				}
+
+				launch(workerIndex, sliceIndex)
+			}
+		}
+
+		dispatch()
+
+		completed := 0
+		for completed < cfg.NSlices {
+			finalResult := <-results
+
+			workerIndex := finalResult.workerIndex
+			workers[workerIndex].busy = false
+
+			if finalResult.err != nil || len(finalResult.grad) != D {
+				// temp error
+				workers[workerIndex].alive = false
+				retrySlices = append(retrySlices, sliceIndex)
+			} else {
+				partialGrads[finalResult.sliceIndex] = finalResult.grad
+				completed++
+			}
+			
+			dispatch()
+			
+
+			if nextSlice < cfg.NSlices && workers[workerIndex].alive {
+				launch(workerIndex, nextSlice)
+				nextSlice++
+			}
+		}
+
+		fullGrad := make([]float64, D)
+		for sliceIndex := 0; sliceIndex < cfg.NSlices; sliceIndex++ {
+			for i := range D; {
+				fullGrad[i] += partialGrads[sliceIndex][i]
+			}
+		}
+
+		for i := range w {
+			w[i] -= cfg.LR * fullGrad[i] / float64(cfg.BatchSize)
+		}
+
+		if cfg.OnStep != nil {
+			weightCopy := make([]float64, len(w))
+			copy(weightCopy, w)
+			cfg.OnStep(step, weightCopy)
+		}
+	}
+
+	return w
 }
 
 /* main -- one binary, four modes. Leave this as it is. */

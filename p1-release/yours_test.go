@@ -72,7 +72,6 @@ func TestLocalDiffRanks(t *testing.T) {
 		}
 	}
 
-	
 }
 
 // Template for Part 3. Uncomment when RunWorker works. Starts one
@@ -87,4 +86,4 @@ func TestLocalDiffRanks(t *testing.T) {
 // 	if addr == "" {
 // 		t.Fatal("RunWorker returned an empty address")
 // 	}
-// }
+// }d
