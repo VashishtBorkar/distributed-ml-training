@@ -244,10 +244,23 @@ type workerState struct {
 }
 
 type sliceResult struct {
+	attemptID   int
 	workerIndex int
+	step        int
 	sliceIndex  int
 	grad        []float64
 	err         error
+	timedOut    bool
+}
+
+type attemptState struct {
+	step        int
+	sliceIndex  int
+	workerIndex int
+	finished    bool
+	timedOut    bool
+	timer       *time.Timer
+	timerDone   chan struct{}
 }
 
 // RunCoordinator drives training end to end and returns the final
@@ -266,6 +279,9 @@ func RunCoordinator(cfg DistConfig) []float64 {
 	if len(cfg.Workers) == 0 {
 		panic("RunCoordinator: no workers")
 	}
+	if cfg.Timeout <= 0 {
+		panic("RunCoordinator: Timeout must be positive")
+	}
 
 	w := Init(cfg.Seed)
 	batcher := NewBatcher(cfg.Seed, cfg.BatchSize)
@@ -280,16 +296,75 @@ func RunCoordinator(cfg DistConfig) []float64 {
 		}
 	}
 
+	events := make(chan sliceResult, 2*len(cfg.Workers))
+	done := make(chan struct{})
+	defer close(done)
+
+	sendEvent := func(result sliceResult) {
+		select {
+		case events <- result:
+		case <-done:
+		}
+	}
+	attempts := make(map[int]*attemptState)
+	nextAttemptID := 0
+
 	for step := 0; step < cfg.Steps; step++ {
 		batch := batcher.Next(step)
-		results := make(chan sliceResult, cfg.NSlices)
 		partialGrads := make([][]float64, cfg.NSlices)
+		sliceDone := make([]bool, cfg.NSlices)
 
 		launch := func(workerIndex int, sliceIndex int) {
 			start := sliceIndex * sliceSize
 			end := start + sliceSize
 
+			attemptStep := step
+			attemptID := nextAttemptID
+			nextAttemptID++
+
+			attempt := &attemptState{
+				step:        step,
+				sliceIndex:  sliceIndex,
+				workerIndex: workerIndex,
+				timerDone:   make(chan struct{}),
+			}
+			attempts[attemptID] = attempt
+			workers[workerIndex].busy = true
+
 			workerAddr := workers[workerIndex].addr
+
+			attempt.timer = time.NewTimer(cfg.Timeout)
+
+			go func(attemptID int, attemptStep int, workerIndex int,
+				sliceIndex int,
+				timer *time.Timer,
+				timerDone <-chan struct{},
+			) {
+				select {
+				case <-timer.C:
+					sendEvent(sliceResult{
+						attemptID:   attemptID,
+						step:        attemptStep,
+						workerIndex: workerIndex,
+						sliceIndex:  sliceIndex,
+						timedOut:    true,
+					})
+
+				case <-timerDone:
+					return
+
+				case <-done:
+					timer.Stop()
+					return
+				}
+			}(
+				attemptID,
+				attemptStep,
+				workerIndex,
+				sliceIndex,
+				attempt.timer,
+				attempt.timerDone,
+			)
 
 			weightCopy := make([]float64, len(w))
 			copy(weightCopy, w)
@@ -301,29 +376,32 @@ func RunCoordinator(cfg DistConfig) []float64 {
 				Batch:      batch[start:end],
 			}
 
-			workers[workerIndex].busy = true
-
 			go func(workerIndex int, addr string, args GradArgs) {
 				client, err := rpc.Dial("tcp", addr)
 				if err != nil {
-					results <- sliceResult{
+					sendEvent(sliceResult{
+						attemptID:   attemptID,
+						step:        attemptStep,
 						workerIndex: workerIndex,
 						sliceIndex:  args.SliceIndex,
 						err:         err,
-					}
+					})
 					return
+
 				}
 				defer client.Close()
 
 				var reply GradReply
 				err = client.Call("Worker.Grad", args, &reply)
 
-				results <- sliceResult{
+				sendEvent(sliceResult{
+					attemptID:   attemptID,
+					step:        attemptStep,
 					workerIndex: workerIndex,
 					sliceIndex:  args.SliceIndex,
 					grad:        reply.Grad,
 					err:         err,
-				}
+				})
 			}(workerIndex, workerAddr, args)
 		}
 
@@ -331,9 +409,14 @@ func RunCoordinator(cfg DistConfig) []float64 {
 		retrySlices := make([]int, 0)
 
 		getNextSlice := func() (int, bool) {
-			if len(retrySlices) > 0 {
+			for len(retrySlices) > 0 {
 				sliceIndex := retrySlices[0]
 				retrySlices = retrySlices[1:]
+
+				if sliceDone[sliceIndex] {
+					continue
+				}
+
 				return sliceIndex, true
 			}
 
@@ -342,7 +425,7 @@ func RunCoordinator(cfg DistConfig) []float64 {
 				nextSlice++
 				return sliceIndex, true
 			}
-		
+
 			return 0, false
 		}
 
@@ -365,32 +448,70 @@ func RunCoordinator(cfg DistConfig) []float64 {
 
 		completed := 0
 		for completed < cfg.NSlices {
-			finalResult := <-results
+			hasLiveWorker := false
+			for i := range workers {
+				if workers[i].alive {
+					hasLiveWorker = true
+				}
+			}
 
-			workerIndex := finalResult.workerIndex
+			if !hasLiveWorker {
+				panic("RunCoordinator: no live workers")
+			}
+
+			result := <-events
+
+			attempt, exists := attempts[result.attemptID]
+			if !exists {
+				continue
+			}
+
+			if result.timedOut {
+				if attempt.finished || attempt.timedOut {
+					continue
+				}
+
+				attempt.timedOut = true
+				if attempt.step == step && !sliceDone[attempt.sliceIndex] {
+					retrySlices = append(retrySlices, attempt.sliceIndex)
+				}
+
+				dispatch()
+				continue
+			}
+
+			if attempt.finished {
+				continue
+			}
+
+			attempt.finished = true
+			attempt.timer.Stop()
+			close(attempt.timerDone)
+			delete(attempts, result.attemptID)
+
+			workerIndex := attempt.workerIndex
+			sliceIndex := attempt.sliceIndex
 			workers[workerIndex].busy = false
 
-			if finalResult.err != nil || len(finalResult.grad) != D {
-				// temp error
+			if result.err != nil || len(result.grad) != D {
 				workers[workerIndex].alive = false
-				retrySlices = append(retrySlices, sliceIndex)
-			} else {
-				partialGrads[finalResult.sliceIndex] = finalResult.grad
+
+				if attempt.step == step && !sliceDone[sliceIndex] {
+					retrySlices = append(retrySlices, sliceIndex)
+				}
+
+			} else if attempt.step == step && !sliceDone[sliceIndex] {
+				partialGrads[sliceIndex] = result.grad
+				sliceDone[sliceIndex] = true
 				completed++
 			}
-			
-			dispatch()
-			
 
-			if nextSlice < cfg.NSlices && workers[workerIndex].alive {
-				launch(workerIndex, nextSlice)
-				nextSlice++
-			}
+			dispatch()
 		}
 
 		fullGrad := make([]float64, D)
 		for sliceIndex := 0; sliceIndex < cfg.NSlices; sliceIndex++ {
-			for i := range D; {
+			for i := 0; i < D; i++ {
 				fullGrad[i] += partialGrads[sliceIndex][i]
 			}
 		}
