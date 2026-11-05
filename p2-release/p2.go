@@ -33,13 +33,16 @@ extends it with primary-backup replication by adding a backup
 address.
 */
 type KVServer struct {
-	mu     sync.Mutex
-	me     string /* this server's RPC address, e.g. "localhost:9001" */
-	backup string /* backup's RPC address, "" if this server is the backup */
-	dead   int32  /* set to 1 by Kill */
-	mp  map[string]string
+	mu         sync.Mutex
+	me         string /* this server's RPC address, e.g. "localhost:9001" */
+	backup     string /* backup's RPC address, "" if this server is the backup */
+	dead       int32  /* set to 1 by Kill */
+	mp         map[string]string
 	getReplies map[Xid]GetReply
 	putReplies map[Xid]PutAppendReply
+
+	backupConn   net.Conn
+	backupClient *rpc.Client
 
 	/*
 	   ADD YOUR CODE HERE: your key-value store, your dedup table,
@@ -130,6 +133,43 @@ func (kv *KVServer) Put(args PutAppendArgs, reply *PutAppendReply) error {
 
 	kv.mp[args.Key] = args.Value
 
+	if kv.backup != "" {
+		forwardArgs := ForwardArgs{Key: args.Key, Value: args.Value, Xid: args.Xid, Op: args.Op}
+		for {
+			if kv.isDead() {
+				reply.Err = ErrNetwork
+				return nil
+			}
+
+			var forwardReply ForwardReply
+
+			if kv.backupClient == nil {
+				conn, err := net.DialTimeout("tcp", kv.backup, time.Second)
+				if err != nil {
+					time.Sleep(50 * time.Millisecond)
+					continue
+				}
+				kv.backupConn = conn
+				kv.backupClient = rpc.NewClient(conn)
+			}
+
+			err := kv.backupConn.SetDeadline(time.Now().Add(time.Second))
+			if err == nil {
+				err = kv.backupClient.Call("KVServer.ForwardOp", forwardArgs, &forwardReply)
+			}
+
+			if err == nil && forwardReply.Err == OK {
+				break
+			}
+
+			kv.backupClient.Close()
+			kv.backupClient = nil
+			kv.backupConn = nil
+
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
 	reply.Err = OK
 	kv.putReplies[args.Xid] = *reply
 
@@ -148,7 +188,28 @@ at-most-once) and returns OK.
 */
 func (kv *KVServer) ForwardOp(args ForwardArgs, reply *ForwardReply) error {
 	/* ADD YOUR CODE HERE */
-	panic("not implemented yet")
+	/* ADD YOUR CODE HERE */
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if kv.isDead() {
+		reply.Err = ErrNetwork
+		return nil
+	}
+
+	cacheReply, inCache := kv.putReplies[args.Xid]
+
+	if inCache {
+		*reply = ForwardReply{Err: cacheReply.Err}
+		return nil
+	}
+
+	kv.mp[args.Key] = args.Value
+
+	reply.Err = OK
+	kv.putReplies[args.Xid] = PutAppendReply{Err: OK}
+
+	return nil
 }
 
 /* ========================================================================
@@ -165,7 +226,7 @@ type Clerk struct {
 	primary string /* primary server address */
 	xid     uint64 /* atomic counter for fresh Xids */
 	client  *rpc.Client
-	conn	net.Conn
+	conn    net.Conn
 
 	/*
 	   ADD YOUR CODE HERE: cached RPC client, etc.
@@ -193,11 +254,11 @@ reuse it.
 // }
 
 func (ck *Clerk) nextXid() Xid {
-    var buf [8]byte
-    if _, err := rand.Read(buf[:]); err != nil {
-        panic(err)
-    }
-    return Xid(binary.BigEndian.Uint64(buf[:]))
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		panic(err)
+	}
+	return Xid(binary.BigEndian.Uint64(buf[:]))
 }
 
 /*
@@ -225,8 +286,8 @@ func (ck *Clerk) Get(key string) string {
 				time.Sleep(50 * time.Millisecond)
 				continue
 			}
-		} 
-		
+		}
+
 		err := ck.conn.SetDeadline(time.Now().Add(time.Second))
 		if err == nil {
 			err = ck.client.Call("KVServer.Get", args, &reply)
@@ -270,8 +331,8 @@ func (ck *Clerk) Put(key, value string) {
 				time.Sleep(50 * time.Millisecond)
 				continue
 			}
-		} 
-		
+		}
+
 		err := ck.conn.SetDeadline(time.Now().Add(time.Second))
 		if err == nil {
 			err = ck.client.Call("KVServer.Put", args, &reply)
@@ -302,6 +363,14 @@ kv.isDead() and exit; subsequent RPCs should return ErrNetwork.
 */
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if kv.backupClient != nil {
+		kv.backupClient.Close()
+		kv.backupClient = nil
+		kv.backupConn = nil
+	}
 }
 
 func (kv *KVServer) isDead() bool {
@@ -358,17 +427,17 @@ func serveForever(addr string) {
 	   ADD YOUR CODE HERE: net.Listen on tcp addr, loop over rpc.Accept.
 	*/
 	listener, err := net.Listen("tcp", addr)
-    if err != nil {
-        die(fmt.Sprintf("listen: %v", err))
-    }
-    defer listener.Close()
+	if err != nil {
+		die(fmt.Sprintf("listen: %v", err))
+	}
+	defer listener.Close()
 
-    for {
-        conn, err := listener.Accept()
-        if err != nil {
-            die(fmt.Sprintf("accept: %v", err))
-        }
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			die(fmt.Sprintf("accept: %v", err))
+		}
 
-        go rpc.ServeConn(conn)
-    }
+		go rpc.ServeConn(conn)
+	}
 }
